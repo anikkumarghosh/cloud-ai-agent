@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.next/
+out/
+build/
+
+# Environment / secrets
+.env
+.env.*
+
+# Runtime data
+local-agent-sandbox/workspace/
+server.log
+
+# Misc
+*.tsbuildinfo
+.DS_Store
+npm-debug.log*
