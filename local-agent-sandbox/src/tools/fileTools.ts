@@ -71,8 +71,8 @@ export async function writeFile(sandbox: SandboxManager, args: { path?: string; 
     await sandbox.exec(`mkdir -p /workspace/${dirPath}`);
   }
 
-  const safeContent = args.content.replace(/'/g, "'\\''");
-  const res = await sandbox.exec(`cat << 'EOF' > /workspace/${filePath}\n${safeContent}\nEOF`);
+  const delimiter = 'AGENT_EOF_' + Math.random().toString(36).slice(2, 8);
+  const res = await sandbox.exec(`cat << '${delimiter}' > /workspace/${filePath}\n${args.content}\n${delimiter}`);
   return res.exitCode === 0
     ? `Successfully wrote file: ${filePath}`
     : `Error writing file: ${res.stderr}`;

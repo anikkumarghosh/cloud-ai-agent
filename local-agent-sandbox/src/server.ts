@@ -37,7 +37,7 @@ function broadcast(event: AgentEvent) {
 
 // REST: Health Check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', sandboxRunning: sandbox.isRunning });
+  res.json({ status: 'ok', sandboxRunning: sandbox.isRunning, idePort: sandbox.getIdePort() });
 });
 
 // REST: Explicitly stop the sandbox
@@ -47,6 +47,19 @@ app.post('/api/sandbox/stop', async (req, res) => {
       await sandbox.destroy();
     }
     res.json({ status: 'stopped' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// REST: Report which exposed app port is actually listening (for the live preview)
+app.get('/api/sandbox/preview-port', async (req, res) => {
+  try {
+    if (!sandbox.isRunning) {
+      return res.json(null);
+    }
+    const result = await sandbox.getActivePreviewPort();
+    res.json(result);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

@@ -18,12 +18,22 @@ export interface ExecResult {
 }
 
 export class SandboxManager {
+  private static readonly CONTAINER_NAME = 'cloud-ai-agent-sandbox';
   private docker: Docker;
   private container: Docker.Container | null = null;
   private config: Required<SandboxConfig>;
+  private portMap: Docker.PortMap | null = null;
 
   get isRunning(): boolean {
     return this.container !== null;
+  }
+
+  /**
+   * Returns the auto-assigned host port for the Code-Server IDE (8080/tcp),
+   * or null if the sandbox is not running.
+   */
+  getIdePort(): string | null {
+    return this.portMap?.['8080/tcp']?.[0]?.HostPort ?? null;
   }
 
   constructor(config: SandboxConfig) {
@@ -51,22 +61,49 @@ export class SandboxManager {
     console.log(`[Sandbox] Checking for image '${this.config.image}'...`);
     // NOTE: Skipping ensureImageExists() here assuming local-ai-sandbox is built locally.
 
+    // Cleanup any orphaned/zombie container from a previous session that still
+    // holds our name/ports, otherwise it blocks every new session (port conflict).
+    try {
+      const existing = this.docker.getContainer(SandboxManager.CONTAINER_NAME);
+      await existing.remove({ force: true });
+    } catch (err: any) {
+      // 404 = no existing container; anything else is unexpected but non-fatal.
+      if (err?.statusCode !== 404) {
+        console.log(`[Sandbox] Note: cleanup of stale container skipped (${err?.message ?? err})`);
+      }
+    }
+
     console.log(`[Sandbox] Spawning container with workspace: ${this.config.workspaceHostPath}`);
 
     const cpuQuota = Math.floor(100000 * this.config.cpuQuotaCoreRatio);
 
     this.container = await this.docker.createContainer({
+      name: SandboxManager.CONTAINER_NAME,
       Image: this.config.image,
       Cmd: ['/bin/sh', '-c', 'code-server --auth none --bind-addr 0.0.0.0:8080 /workspace & tail -f /dev/null'],
       Tty: false,
       WorkingDir: '/workspace',
       ExposedPorts: {
-        '8080/tcp': {} // Expose Web IDE port
+        '8080/tcp': {}, // Code-Server IDE
+        '3000/tcp': {},
+        '5000/tcp': {},
+        '5173/tcp': {},
+        '8000/tcp': {},
+        '8501/tcp': {},
+        '4000/tcp': {},
       },
       HostConfig: {
         Binds: [`${this.config.workspaceHostPath}:/workspace`],
         PortBindings: {
-          '8080/tcp': [{ HostPort: '8080' }] // Map to host localhost:8080
+          // Empty HostPort = Docker auto-assigns a free host port, so a
+          // leftover container or another process can never block a new session.
+          '8080/tcp': [{ HostPort: '' }],
+          '3000/tcp': [{ HostPort: '' }],
+          '5000/tcp': [{ HostPort: '' }],
+          '5173/tcp': [{ HostPort: '' }],
+          '8000/tcp': [{ HostPort: '' }],
+          '8501/tcp': [{ HostPort: '' }],
+          '4000/tcp': [{ HostPort: '' }],
         },
         Memory: this.config.memoryLimitMB * 1024 * 1024,
         CpuPeriod: 100000,
@@ -75,7 +112,47 @@ export class SandboxManager {
     });
 
     await this.container.start();
+
+    // Read back the auto-assigned host ports, e.g. { '3000/tcp': [{ HostIp: '0.0.0.0', HostPort: '55231' }] }
+    const info = await this.container.inspect();
+    this.portMap = info.NetworkSettings.Ports;
+
     console.log(`[Sandbox] Container started (ID: ${this.container.id.substring(0, 12)})`);
+    console.log(`[Sandbox] Web IDE active on http://localhost:${this.getIdePort()}`);
+  }
+
+  /**
+   * Detects which of the exposed dev ports is actually listening inside the
+   * container and returns the matching host port. Returns null if none are live.
+   *
+   * Uses /proc/net/tcp because `ss`/`netstat` are not installed in slim images.
+   */
+  async getActivePreviewPort(): Promise<{ containerPort: string; hostPort: string } | null> {
+    if (!this.container || !this.portMap) return null;
+
+    const result = await this.exec(
+      "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk 'NR>1 {print $2}' | grep ':' | cut -d: -f2",
+      5000
+    );
+
+    if (result.exitCode !== 0) return null;
+
+    // Ports in /proc/net/tcp are hex. Rough filter: includes all socket states,
+    // which is fine here — a false positive just shows a port that turns out empty.
+    const listeningPorts = new Set(
+      result.stdout
+        .split('\n')
+        .map((p) => p.trim())
+        .filter(Boolean)
+        .map((hex) => parseInt(hex, 16).toString())
+    );
+
+    const candidates = ['3000', '5173', '5000', '8000', '8501', '4000'];
+    const match = candidates.find((p) => listeningPorts.has(p));
+    if (!match) return null;
+
+    const hostPort = this.portMap[`${match}/tcp`]?.[0]?.HostPort;
+    return hostPort ? { containerPort: match, hostPort } : null;
   }
 
   /**
@@ -170,6 +247,7 @@ export class SandboxManager {
       console.log(`[Sandbox] Removing container...`);
       await this.container.remove({ force: true });
       this.container = null;
+      this.portMap = null;
       console.log(`[Sandbox] Cleanup complete.`);
     } catch (err: any) {
       if (err.statusCode !== 404) throw err;

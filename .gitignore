@@ -13,7 +13,8 @@ build/
 
 # Runtime data
 local-agent-sandbox/workspace/
-server.log
+*.log
+server-err.log
 
 # Misc
 *.tsbuildinfo

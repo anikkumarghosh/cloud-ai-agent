@@ -122,6 +122,37 @@ export class Agent {
     this.emitter = emitter;
   }
 
+  private async completeChat(messages: any[]): Promise<any> {
+    const MAX_RETRIES = 3;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        return await this.groq.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
+          messages,
+          tools: allTools,
+          tool_choice: 'auto'
+        });
+      } catch (err: any) {
+        const errorBody = typeof err?.error === 'object' ? err.error : {};
+        const isToolCallFailure =
+          errorBody?.code === 'tool_use_failed' ||
+          (err?.status === 400 && /tool|function/i.test(err?.message ?? ''));
+
+        if (!isToolCallFailure || attempt === MAX_RETRIES) {
+          throw err;
+        }
+
+        this.emitter.emitEvent('agent_message', {
+          message: `[Retry ${attempt}/${MAX_RETRIES}] Tool call generation was rejected by the model provider. Retrying...`
+        });
+        await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+      }
+    }
+
+    throw new Error('Unreachable: completeChat exhausted all retries.');
+  }
+
   private initializeContext() {
     this.contextHistory = [
       {
@@ -148,13 +179,7 @@ export class Agent {
     while (!isTaskComplete && loopCount < MAX_LOOPS) {
       loopCount++;
 
-      const response = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: this.contextHistory,
-        tools: allTools,
-        tool_choice: 'auto'
-      });
-
+      const response = await this.completeChat(this.contextHistory);
       const responseMessage = response.choices[0].message;
       this.contextHistory.push(responseMessage);
 
@@ -165,7 +190,15 @@ export class Agent {
       if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
         for (const toolCall of responseMessage.tool_calls) {
           const fnName = toolCall.function.name;
-          const args = JSON.parse(toolCall.function.arguments);
+          let args: any;
+          try {
+            args = JSON.parse(toolCall.function.arguments);
+          } catch {
+            this.emitter.emitEvent('agent_error', {
+              message: `Failed to parse arguments for tool '${fnName}'. Raw arguments: ${toolCall.function.arguments}`
+            });
+            throw new Error(`Malformed tool arguments for '${fnName}' (not valid JSON).`);
+          }
 
           this.emitter.emitEvent('tool_start', {
             tool: fnName,

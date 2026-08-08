@@ -279,7 +279,14 @@ export default function Dashboard() {
   // New Lifecycle States
   const [isSandboxActive, setIsSandboxActive] = useState(false);
   const [isIdeReady, setIsIdeReady] = useState(false);
-  
+  const [idePort, setIdePort] = useState<string | null>(null);
+
+  // Preview states
+  const [activeTab, setActiveTab] = useState<'ide' | 'preview'>('ide');
+  const [previewKey, setPreviewKey] = useState(0);
+  const [previewPort, setPreviewPort] = useState<{ containerPort: string; hostPort: string } | null>(null);
+  const lastPreviewHostRef = useRef<string | null>(null);
+
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -312,8 +319,19 @@ export default function Dashboard() {
 
     const checkReady = async () => {
       try {
-        await fetch('http://localhost:8080', { mode: 'no-cors' });
-        if (!cancelled) setIsIdeReady(true);
+        // The IDE host port is auto-assigned by Docker, so ask the backend for it.
+        const healthRes = await fetch('http://localhost:4000/api/health');
+        const health = await healthRes.json();
+        const port = health.idePort as string | null;
+        if (port) {
+          await fetch(`http://localhost:${port}`, { mode: 'no-cors' });
+          if (!cancelled) {
+            setIdePort(port);
+            setIsIdeReady(true);
+          }
+        } else if (!cancelled) {
+          retryTimer = setTimeout(checkReady, 2000);
+        }
       } catch {
         if (!cancelled) retryTimer = setTimeout(checkReady, 2000);
       }
@@ -325,6 +343,43 @@ export default function Dashboard() {
       if (retryTimer) clearTimeout(retryTimer);
     };
   }, [isSandboxActive, isIdeReady]);
+
+  // Poll the backend for the live app preview port while the sandbox is active
+  useEffect(() => {
+    if (!isSandboxActive) return;
+    let cancelled = false;
+
+    const pollPreviewPort = async () => {
+      try {
+        const res = await fetch('http://localhost:4000/api/sandbox/preview-port');
+        if (!res.ok) throw new Error('Failed to poll preview port');
+        const data = await res.json();
+        if (!cancelled) setPreviewPort(data);
+      } catch (err) {
+        console.error('Failed to poll preview port:', err);
+      }
+    };
+
+    pollPreviewPort();
+    const interval = setInterval(pollPreviewPort, 2000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [isSandboxActive]);
+
+  // Remount the preview iframe whenever the detected host port changes
+  useEffect(() => {
+    if (previewPort) {
+      if (lastPreviewHostRef.current !== previewPort.hostPort) {
+        lastPreviewHostRef.current = previewPort.hostPort;
+        setPreviewKey((k) => k + 1);
+      }
+    } else {
+      lastPreviewHostRef.current = null;
+    }
+  }, [previewPort]);
 
   const handleRunAgent = async () => {
     if (!goal.trim() || !wsReady) return;
@@ -360,6 +415,9 @@ export default function Dashboard() {
       setIsSandboxActive(false);
       setIsIdeReady(false);
       setIsRunning(false);
+      setIdePort(null);
+      setPreviewPort(null);
+      lastPreviewHostRef.current = null;
       setEvents((prev) => [
         ...prev,
         { runId: 'system', type: 'agent_message', timestamp: new Date().toISOString(), data: { message: 'Environment manually stopped and destroyed.' } }
@@ -467,28 +525,63 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* BOTTOM HALF: Web IDE */}
+        {/* BOTTOM HALF: Web IDE + Live Preview */}
         <div className="h-[60%] flex flex-col bg-[#1e1e1e]">
-          <div className="p-3 bg-[#252526] border-b border-[#333333]">
-            <h2 className="text-xs font-semibold text-neutral-400 tracking-wider uppercase flex items-center gap-2">
-              <Code2 className="w-3 h-3" /> Workspace IDE (Code-Server)
-            </h2>
+          <div className="p-3 bg-[#252526] border-b border-[#333333] flex items-center gap-1">
+            <button
+              onClick={() => setActiveTab('ide')}
+              className={`text-xs font-semibold tracking-wider uppercase flex items-center gap-2 px-3 py-1.5 rounded transition-colors ${
+                activeTab === 'ide'
+                  ? 'bg-[#37373d] text-white'
+                  : 'text-neutral-400 hover:text-neutral-200'
+              }`}
+            >
+              <Code2 className="w-3 h-3" /> Workspace IDE
+            </button>
+            <button
+              onClick={() => setActiveTab('preview')}
+              className={`text-xs font-semibold tracking-wider uppercase flex items-center gap-2 px-3 py-1.5 rounded transition-colors ${
+                activeTab === 'preview'
+                  ? 'bg-[#37373d] text-white'
+                  : 'text-neutral-400 hover:text-neutral-200'
+              }`}
+            >
+              <Play className="w-3 h-3" /> Live App Preview
+              {previewPort && (
+                <span className="ml-1 text-[10px] bg-emerald-900 text-emerald-300 px-1.5 py-0.5 rounded">
+                  ● Port {previewPort.containerPort}
+                </span>
+              )}
+            </button>
           </div>
           <div className="flex-1 relative">
-            {!isSandboxActive ? (
-              <div className="absolute inset-0 flex items-center justify-center text-neutral-600 text-sm italic">
-                Environment inactive. Click Run Task to boot sandbox.
-              </div>
-            ) : !isIdeReady ? (
-              <div className="absolute inset-0 flex items-center justify-center text-blue-400 text-sm gap-2">
-                <Loader2 className="w-4 h-4 animate-spin" /> Booting VS Code Server...
-              </div>
-            ) : (
-              <iframe 
-                src="http://localhost:8080" 
+            {activeTab === 'ide' ? (
+              !isSandboxActive ? (
+                <div className="absolute inset-0 flex items-center justify-center text-neutral-600 text-sm italic">
+                  Environment inactive. Click Run Task to boot sandbox.
+                </div>
+              ) : !isIdeReady ? (
+                <div className="absolute inset-0 flex items-center justify-center text-blue-400 text-sm gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin" /> Booting VS Code Server...
+                </div>
+              ) : (
+                <iframe
+                  src={idePort ? `http://localhost:${idePort}` : 'about:blank'}
+                  className="absolute inset-0 w-full h-full border-none"
+                  title="Workspace IDE"
+                />
+              )
+            ) : previewPort ? (
+              <iframe
+                key={previewKey}
+                src={`http://localhost:${previewPort.hostPort}`}
                 className="absolute inset-0 w-full h-full border-none"
-                title="Workspace IDE"
+                title="Live Preview"
               />
+            ) : (
+              <div className="absolute inset-0 flex items-center justify-center text-neutral-500 text-sm italic bg-[#1e1e1e]">
+                No live server detected yet. Waiting for the agent to start one...
+              </div>
             )}
           </div>
         </div>
